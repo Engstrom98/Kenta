@@ -168,13 +168,34 @@ def start_http_server(port: int, directory: str) -> HTTPServer:
 # Sonos
 # ---------------------------------------------------------------------------
 def discover_sonos() -> soco.SoCo:
-    """Discover and return the first Sonos speaker on the network."""
+    """Discover Sonos speakers and let the user choose one."""
     log.info("Discovering Sonos speakers...")
     zones = soco.discover(timeout=10)
     if not zones:
         raise RuntimeError("No Sonos speakers found on the network")
-    speaker = list(zones)[0]
-    log.info("Found Sonos: %s (%s)", speaker.player_name, speaker.ip_address)
+
+    speakers = sorted(zones, key=lambda s: s.player_name)
+
+    if len(speakers) == 1:
+        speaker = speakers[0]
+        log.info("Found one Sonos speaker: %s (%s)", speaker.player_name, speaker.ip_address)
+        return speaker
+
+    print("\nAvailable Sonos speakers:")
+    for i, s in enumerate(speakers, 1):
+        print(f"  {i}. {s.player_name} ({s.ip_address})")
+
+    while True:
+        try:
+            choice = int(input(f"\nSelect a speaker [1-{len(speakers)}]: "))
+            if 1 <= choice <= len(speakers):
+                break
+        except (ValueError, EOFError):
+            pass
+        print("Invalid choice, try again.")
+
+    speaker = speakers[choice - 1]
+    log.info("Selected Sonos: %s (%s)", speaker.player_name, speaker.ip_address)
     return speaker
 
 
