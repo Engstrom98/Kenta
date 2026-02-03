@@ -9,6 +9,7 @@ Usage:
     python test_client.py path/to/speech.wav
 """
 
+import audioop
 import socket
 import struct
 import math
@@ -31,13 +32,28 @@ def generate_sine_wave(freq: float = 440, duration: float = 3.0) -> bytes:
 
 
 def load_wav_pcm(path: str) -> bytes:
-    """Read a WAV file and return its raw PCM frames."""
+    """Read a WAV file and return raw PCM converted to 16kHz, 16-bit, mono."""
     with wave.open(path, "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        framerate = wf.getframerate()
         print(
-            f"WAV: {wf.getnchannels()}ch, {wf.getframerate()}Hz, "
-            f"{wf.getsampwidth() * 8}-bit, {wf.getnframes()} frames"
+            f"WAV: {channels}ch, {framerate}Hz, "
+            f"{sample_width * 8}-bit, {wf.getnframes()} frames"
         )
-        return wf.readframes(wf.getnframes())
+        pcm = wf.readframes(wf.getnframes())
+
+    if channels > 1:
+        pcm = audioop.tomono(pcm, sample_width, 1.0, 1.0)
+
+    if sample_width != 2:
+        pcm = audioop.lin2lin(pcm, sample_width, 2)
+
+    if framerate != SAMPLE_RATE:
+        pcm, _ = audioop.ratecv(pcm, 2, 1, framerate, SAMPLE_RATE, None)
+
+    print(f"Converted to: 1ch, {SAMPLE_RATE}Hz, 16-bit")
+    return pcm
 
 
 def main():
