@@ -32,6 +32,8 @@ OPENAI_MODEL_TTS = "gpt-4o-mini-tts"
 OPENAI_MODEL_STT = "gpt-4o-mini-transcribe"
 OPENAI_TTS_VOICE = "coral"
 
+HISTORY_TIMEOUT = 7200  # seconds (2 hours) of inactivity before clearing history
+
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant. Keep your responses concise and "
     "conversational, suitable for being spoken aloud. Aim for 1-3 sentences "
@@ -53,9 +55,11 @@ log = logging.getLogger("esp_server")
 client = OpenAI()
 
 # ---------------------------------------------------------------------------
-# Conversation history (reset on server restart)
+# Conversation history (cleared after HISTORY_TIMEOUT of inactivity)
 # ---------------------------------------------------------------------------
 conversation_history: list[dict] = []
+last_message_time: float = 0.0
+history_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -106,18 +110,31 @@ def transcribe_audio(wav_file: io.BytesIO) -> str:
 # ---------------------------------------------------------------------------
 def chat_completion(user_text: str) -> str:
     """Send user text to ChatGPT and return the assistant reply."""
+    global last_message_time
+
     log.info("Getting chat completion...")
-    conversation_history.append({"role": "user", "content": user_text})
+
+    with history_lock:
+        now = time.time()
+        if last_message_time and now - last_message_time > HISTORY_TIMEOUT:
+            log.info("Conversation inactive for >%ds — clearing history", HISTORY_TIMEOUT)
+            conversation_history.clear()
+        conversation_history.append({"role": "user", "content": user_text})
+        last_message_time = now
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *conversation_history,
+        ]
 
     response = client.chat.completions.create(
         model=OPENAI_MODEL_CHAT,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *conversation_history,
-        ],
+        messages=messages,
     )
     reply = response.choices[0].message.content.strip()
-    conversation_history.append({"role": "assistant", "content": reply})
+
+    with history_lock:
+        conversation_history.append({"role": "assistant", "content": reply})
+
     log.info("Chat reply: %s", reply)
     return reply
 
