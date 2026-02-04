@@ -1,3 +1,4 @@
+import argparse
 import socket
 import wave
 import io
@@ -33,6 +34,8 @@ OPENAI_MODEL_STT = "gpt-4o-mini-transcribe"
 OPENAI_TTS_VOICE = "coral"
 
 HISTORY_TIMEOUT = 7200  # seconds (2 hours) of inactivity before clearing history
+
+SONOS_SPEAKER_NAME = "Sovrum"
 
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant. Keep your responses concise and "
@@ -184,14 +187,35 @@ def start_http_server(port: int, directory: str) -> HTTPServer:
 # ---------------------------------------------------------------------------
 # Sonos
 # ---------------------------------------------------------------------------
-def discover_sonos() -> soco.SoCo:
-    """Discover Sonos speakers and let the user choose one."""
+def discover_sonos(ip: str | None = None) -> soco.SoCo:
+    """Discover Sonos speakers and let the user choose one.
+
+    If *ip* is provided, skip discovery and connect directly.
+    """
+    if ip:
+        speaker = soco.SoCo(ip)
+        log.info("Using Sonos speaker at %s (%s)", speaker.ip_address, speaker.player_name)
+        return speaker
+
     log.info("Discovering Sonos speakers...")
-    zones = soco.discover(timeout=10)
+    zones = soco.discover(timeout=10, allow_network_scan=True)
     if not zones:
-        raise RuntimeError("No Sonos speakers found on the network")
+        raise RuntimeError(
+            "No Sonos speakers found on the network. "
+            "Try passing --ip <speaker-ip> to connect directly."
+        )
 
     speakers = sorted(zones, key=lambda s: s.player_name)
+
+    # Auto-select preferred speaker if configured
+    if SONOS_SPEAKER_NAME:
+        for s in speakers:
+            if s.player_name == SONOS_SPEAKER_NAME:
+                log.info("Auto-selected Sonos speaker: %s (%s)", s.player_name, s.ip_address)
+                return s
+        log.warning("Preferred speaker '%s' not found among: %s",
+                     SONOS_SPEAKER_NAME,
+                     ", ".join(s.player_name for s in speakers))
 
     if len(speakers) == 1:
         speaker = speakers[0]
@@ -303,6 +327,10 @@ def handle_client(
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser(description="ESP32 voice assistant server")
+    parser.add_argument("--ip", help="Sonos speaker IP (skip discovery)")
+    args = parser.parse_args()
+
     local_ip = get_local_ip()
     log.info("Server LAN IP: %s", local_ip)
 
@@ -311,7 +339,7 @@ def main():
     start_http_server(HTTP_PORT, temp_dir)
 
     # Discover Sonos
-    speaker = discover_sonos()
+    speaker = discover_sonos(args.ip)
 
     # TCP server
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

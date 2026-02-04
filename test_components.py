@@ -245,7 +245,7 @@ def test_sonos():
 
     print("  Scanning network (timeout 10s)...")
     try:
-        zones = soco.discover(timeout=10)
+        zones = soco.discover(timeout=10, allow_network_scan=True)
     except Exception as e:
         return failed(f"Discovery error: {e}")
 
