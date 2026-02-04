@@ -170,6 +170,12 @@ def text_to_speech(text: str) -> str:
 # HTTP server (serves TTS files to Sonos)
 # ---------------------------------------------------------------------------
 class _TtsHandler(SimpleHTTPRequestHandler):
+    def handle(self):
+        try:
+            super().handle()
+        except BrokenPipeError:
+            log.debug("HTTP: client disconnected (broken pipe)")
+
     def log_message(self, format, *args):
         log.debug("HTTP: %s", format % args)
 

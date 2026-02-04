@@ -1,0 +1,1 @@
+- Never commit directly to main. Always create a feature or fix branch first, then merge after changes are verified.
