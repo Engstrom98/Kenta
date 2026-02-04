@@ -31,7 +31,7 @@ END_MARKER = b"\xDE\xAD\xBE\xEF"
 OPENAI_MODEL_CHAT = "gpt-4o"
 OPENAI_MODEL_TTS = "gpt-4o-mini-tts"
 OPENAI_MODEL_STT = "gpt-4o-mini-transcribe"
-OPENAI_TTS_VOICE = "coral"
+OPENAI_TTS_VOICE = "onyx"
 
 HISTORY_TIMEOUT = 7200  # seconds (2 hours) of inactivity before clearing history
 
