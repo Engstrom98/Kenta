@@ -2,3 +2,7 @@
 .env
 venv
 __pycache__/
+firmware/build/
+firmware/.cache/
+firmware/sdkconfig
+firmware/sdkconfig.old
