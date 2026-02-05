@@ -1,0 +1,21 @@
+menu "Kenta Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            WiFi network name.
+
+    config WIFI_PASS
+        string "WiFi Password"
+        default ""
+        help
+            WiFi network password.
+
+    config SERVER_IP
+        string "Server IP Address"
+        default "192.168.1.100"
+        help
+            IP address of the Python backend server.
+
+endmenu
