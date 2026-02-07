@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -13,7 +14,7 @@
 
 static const char *TAG = "kenta";
 
-// WiFi — set these to your network
+// WiFi
 #define WIFI_SSID     CONFIG_WIFI_SSID
 #define WIFI_PASS     CONFIG_WIFI_PASS
 
@@ -21,25 +22,105 @@ static const char *TAG = "kenta";
 #define SERVER_IP     CONFIG_SERVER_IP
 #define SERVER_PORT   12345
 
-// I2S pins (verified with GPIO toggle test)
+// I2S pins
 #define PIN_SCK  32
 #define PIN_WS   25
 #define PIN_SD   33
 
-// Push-to-talk button (BOOT button, active low)
-#define PIN_BTN  0
+// Button & LED pins
+#define PIN_BUTTON  13
+#define PIN_LED_R   4
+#define PIN_LED_G   18
+#define PIN_LED_B   19
 
-// Audio config matching server expectations
+// Audio
 #define SAMPLE_RATE   16000
 #define SAMPLE_BITS   I2S_DATA_BIT_WIDTH_32BIT
 #define DMA_BUF_COUNT 4
 #define DMA_BUF_LEN   256
 
+// Read 256 samples per I2S read
+#define PCM_FRAME_LEN 256
+
+// Grace period after button release (microseconds)
+#define WAIT_TIMEOUT_US (3 * 1000 * 1000)
+
+// recv() timeout in PROCESSING state (seconds)
+#define RECV_TIMEOUT_S  120
+
 // End marker expected by server
 static const uint8_t END_MARKER[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 
+// State machine
+typedef enum {
+    STATE_IDLE,
+    STATE_RECORDING,
+    STATE_WAIT,
+    STATE_PROCESSING,
+} state_t;
+
 static i2s_chan_handle_t rx_chan;
 static SemaphoreHandle_t wifi_ready;
+
+// Static buffers
+static int32_t i2s_raw[PCM_FRAME_LEN];
+static int16_t pcm_frame[PCM_FRAME_LEN];
+
+// ---------------------------------------------------------------------------
+// Button
+// ---------------------------------------------------------------------------
+static void button_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << PIN_BUTTON,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+static bool button_pressed(void)
+{
+    return gpio_get_level(PIN_BUTTON) == 0;  // active low
+}
+
+// ---------------------------------------------------------------------------
+// RGB LED
+// ---------------------------------------------------------------------------
+static void led_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << PIN_LED_R) | (1ULL << PIN_LED_G) | (1ULL << PIN_LED_B),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+static void led_off(void)
+{
+    gpio_set_level(PIN_LED_R, 0);
+    gpio_set_level(PIN_LED_G, 0);
+    gpio_set_level(PIN_LED_B, 0);
+}
+
+static void led_solid_blue(void)
+{
+    gpio_set_level(PIN_LED_R, 0);
+    gpio_set_level(PIN_LED_G, 0);
+    gpio_set_level(PIN_LED_B, 1);
+}
+
+static void led_solid_green(void)
+{
+    gpio_set_level(PIN_LED_R, 0);
+    gpio_set_level(PIN_LED_G, 1);
+    gpio_set_level(PIN_LED_B, 0);
+}
 
 // ---------------------------------------------------------------------------
 // WiFi
@@ -68,10 +149,8 @@ static void wifi_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     wifi_config_t wifi_cfg = {
         .sta = {
@@ -118,27 +197,27 @@ static void i2s_init(void)
 }
 
 // ---------------------------------------------------------------------------
-// Button
+// Read one PCM frame from I2S (256 samples), convert to 16-bit
 // ---------------------------------------------------------------------------
-static void button_init(void)
+static void read_i2s_pcm(void)
 {
-    gpio_config_t btn_cfg = {
-        .pin_bit_mask = (1ULL << PIN_BTN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+    size_t bytes_read;
+    int samples_got = 0;
+
+    while (samples_got < PCM_FRAME_LEN) {
+        int need = PCM_FRAME_LEN - samples_got;
+        i2s_channel_read(rx_chan, i2s_raw + samples_got,
+                         need * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+        samples_got += bytes_read / sizeof(int32_t);
+    }
+
+    for (int i = 0; i < PCM_FRAME_LEN; i++) {
+        pcm_frame[i] = (int16_t)(i2s_raw[i] >> 16);
+    }
 }
 
-static bool button_pressed(void)
-{
-    return gpio_get_level(PIN_BTN) == 0;  // BOOT button is active low
-}
-
 // ---------------------------------------------------------------------------
-// TCP send
+// TCP
 // ---------------------------------------------------------------------------
 static int tcp_connect(void)
 {
@@ -160,12 +239,12 @@ static int tcp_connect(void)
         return -1;
     }
 
-    ESP_LOGI(TAG, "Connected to server %s:%d", SERVER_IP, SERVER_PORT);
+    ESP_LOGI(TAG, "Connected to server");
     return sock;
 }
 
 // ---------------------------------------------------------------------------
-// Main loop
+// Main
 // ---------------------------------------------------------------------------
 void app_main(void)
 {
@@ -174,56 +253,158 @@ void app_main(void)
     wifi_init();
     i2s_init();
     button_init();
+    led_init();
+    led_off();
 
     // Wait for WiFi
     ESP_LOGI(TAG, "Waiting for WiFi...");
     xSemaphoreTake(wifi_ready, portMAX_DELAY);
 
-    // Discard startup samples (datasheet p.10: zero output for 2^18 SCK cycles)
-    static int32_t i2s_buf[256];
-    static int16_t pcm_buf[256];
-    size_t bytes_read;
+    // Discard startup I2S samples
     for (int i = 0; i < 8; i++) {
-        i2s_channel_read(rx_chan, i2s_buf, sizeof(i2s_buf), &bytes_read, portMAX_DELAY);
+        read_i2s_pcm();
     }
 
-    ESP_LOGI(TAG, "Ready! Hold BOOT button to record, release to send.");
+    ESP_LOGI(TAG, "Ready — press button to talk");
+
+    state_t state = STATE_IDLE;
+    int sock = -1;
+    int64_t wait_start = 0;
+    bool led_on = false;
+    int64_t last_blink = 0;
 
     while (1) {
-        // Wait for button press
-        while (!button_pressed()) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        ESP_LOGI(TAG, "Recording...");
+        switch (state) {
 
-        // Connect to server
-        int sock = tcp_connect();
-        if (sock < 0) {
-            // Wait for button release before retrying
-            while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
+        // ==== IDLE: wait for button press ====
+        case STATE_IDLE:
+            if (button_pressed()) {
+                sock = tcp_connect();
+                if (sock < 0) {
+                    // Wait for button release before retrying
+                    while (button_pressed()) {
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                    break;
+                }
+                led_solid_blue();
+                state = STATE_RECORDING;
+                ESP_LOGI(TAG, "Recording...");
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            break;
 
-        // Stream audio while button is held
-        while (button_pressed()) {
-            esp_err_t ret = i2s_channel_read(rx_chan, i2s_buf, sizeof(i2s_buf), &bytes_read, portMAX_DELAY);
-            if (ret != ESP_OK) continue;
-
-            int num_samples = bytes_read / sizeof(int32_t);
-
-            // Convert 32-bit I2S data (24-bit in upper bits) to 16-bit PCM
-            for (int i = 0; i < num_samples; i++) {
-                pcm_buf[i] = (int16_t)(i2s_buf[i] >> 16);
+        // ==== RECORDING: stream audio while button is held ====
+        case STATE_RECORDING:
+            read_i2s_pcm();
+            if (send(sock, pcm_frame, PCM_FRAME_LEN * sizeof(int16_t), 0) < 0) {
+                ESP_LOGE(TAG, "send() failed, aborting");
+                close(sock);
+                sock = -1;
+                led_off();
+                state = STATE_IDLE;
+                break;
             }
 
-            send(sock, pcm_buf, num_samples * sizeof(int16_t), 0);
+            if (!button_pressed()) {
+                // Button released — enter WAIT state
+                wait_start = esp_timer_get_time();
+                last_blink = wait_start;
+                led_on = true;  // start with LED on (already blue)
+                state = STATE_WAIT;
+                ESP_LOGI(TAG, "Button released, waiting 3s...");
+            }
+            break;
+
+        // ==== WAIT: 3s grace period, blink blue ====
+        case STATE_WAIT: {
+            int64_t now = esp_timer_get_time();
+
+            // Blink blue at ~1.5 Hz (toggle every 333ms)
+            if (now - last_blink > 333 * 1000) {
+                led_on = !led_on;
+                gpio_set_level(PIN_LED_B, led_on ? 1 : 0);
+                last_blink = now;
+            }
+
+            if (button_pressed()) {
+                // Resume recording
+                led_solid_blue();
+                state = STATE_RECORDING;
+                ESP_LOGI(TAG, "Button pressed again, resuming recording...");
+                break;
+            }
+
+            if (now - wait_start > WAIT_TIMEOUT_US) {
+                // Grace period expired — send end marker and wait for server
+                ESP_LOGI(TAG, "Grace period expired, processing...");
+                send(sock, END_MARKER, sizeof(END_MARKER), 0);
+
+                // Switch to solid green
+                led_solid_green();
+                state = STATE_PROCESSING;
+            } else {
+                // Keep streaming audio during wait (captures trailing speech)
+                read_i2s_pcm();
+                if (send(sock, pcm_frame, PCM_FRAME_LEN * sizeof(int16_t), 0) < 0) {
+                    ESP_LOGE(TAG, "send() failed during wait");
+                    close(sock);
+                    sock = -1;
+                    led_off();
+                    state = STATE_IDLE;
+                }
+            }
+            break;
         }
 
-        // Send end marker and close
-        send(sock, END_MARKER, sizeof(END_MARKER), 0);
-        close(sock);
-        ESP_LOGI(TAG, "Sent. Waiting for next press...");
+        // ==== PROCESSING: solid green, wait for server done byte ====
+        case STATE_PROCESSING: {
+            fd_set readfds;
+            struct timeval tv;
+            FD_ZERO(&readfds);
+            FD_SET(sock, &readfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100 * 1000;  // 100ms timeout for select
 
-        vTaskDelay(pdMS_TO_TICKS(200));  // debounce
+            int ret = select(sock + 1, &readfds, NULL, NULL, &tv);
+
+            if (ret > 0 && FD_ISSET(sock, &readfds)) {
+                uint8_t done_byte;
+                int n = recv(sock, &done_byte, 1, 0);
+                if (n == 1 && done_byte == 0x01) {
+                    ESP_LOGI(TAG, "Server done, back to idle");
+                } else {
+                    ESP_LOGW(TAG, "Unexpected recv result (n=%d), returning to idle", n);
+                }
+                close(sock);
+                sock = -1;
+                led_off();
+                state = STATE_IDLE;
+                break;
+            }
+
+            if (ret < 0) {
+                ESP_LOGE(TAG, "select() error, returning to idle");
+                close(sock);
+                sock = -1;
+                led_off();
+                state = STATE_IDLE;
+                break;
+            }
+
+            // Overall timeout check
+            int64_t now = esp_timer_get_time();
+            if (now - wait_start > (int64_t)RECV_TIMEOUT_S * 1000 * 1000) {
+                ESP_LOGW(TAG, "Processing timeout (%ds), returning to idle", RECV_TIMEOUT_S);
+                close(sock);
+                sock = -1;
+                led_off();
+                state = STATE_IDLE;
+                break;
+            }
+            break;
+        }
+        }
     }
 }

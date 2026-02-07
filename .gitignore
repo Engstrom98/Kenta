@@ -1,8 +1,12 @@
 .claude/
-.env
-venv
 __pycache__/
+
+# Firmware
 firmware/build/
 firmware/.cache/
 firmware/sdkconfig
 firmware/sdkconfig.old
+
+# Server
+server/.env
+server/venv/

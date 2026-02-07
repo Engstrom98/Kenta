@@ -1,4 +1,5 @@
 import argparse
+import queue
 import socket
 import wave
 import io
@@ -27,6 +28,7 @@ SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2  # 16-bit = 2 bytes
 CHANNELS = 1
 END_MARKER = b"\xDE\xAD\xBE\xEF"
+DONE_BYTE = b"\x01"
 
 OPENAI_MODEL_CHAT = "gpt-4o"
 OPENAI_MODEL_TTS = "gpt-4o-mini-tts"
@@ -252,6 +254,24 @@ def play_on_sonos(speaker: soco.SoCo, audio_url: str):
     speaker.play_uri(audio_url, title="ESP Assistant Response")
 
 
+def wait_for_sonos_done(speaker: soco.SoCo, timeout: int = 120):
+    """Poll Sonos transport state until playback finishes or *timeout* expires."""
+    deadline = time.time() + timeout
+    # Give Sonos a moment to start playing
+    time.sleep(1)
+    while time.time() < deadline:
+        try:
+            info = speaker.get_current_transport_info()
+            state = info.get("current_transport_state", "")
+            if state in ("STOPPED", "PAUSED_PLAYBACK", "NO_MEDIA_PRESENT"):
+                log.info("Sonos playback finished (state=%s)", state)
+                return
+        except Exception:
+            log.warning("Error polling Sonos transport state", exc_info=True)
+        time.sleep(0.5)
+    log.warning("Sonos playback poll timed out after %ds", timeout)
+
+
 # ---------------------------------------------------------------------------
 # TCP: receive audio from ESP32
 # ---------------------------------------------------------------------------
@@ -276,57 +296,76 @@ def receive_audio(conn: socket.socket) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Client handler (full pipeline)
+# Audio queue and processing pipeline
 # ---------------------------------------------------------------------------
-def handle_client(
-    conn: socket.socket,
-    addr: tuple,
-    speaker: soco.SoCo,
-    local_ip: str,
-):
-    """Handle one push-to-talk interaction from the ESP32."""
-    log.info("Connection from %s", addr)
+audio_queue: queue.Queue[tuple[bytes, socket.socket]] = queue.Queue()
+
+
+def _send_done_and_close(conn: socket.socket):
+    """Send the done byte and close the connection."""
     try:
-        # 1. Receive PCM audio
-        pcm_data = receive_audio(conn)
-        if not pcm_data:
-            log.warning("No audio data received")
-            return
-
-        # 2. Wrap in WAV
-        wav_file = pcm_to_wav(pcm_data)
-
-        # 3. Transcribe
-        transcription = transcribe_audio(wav_file)
-        if not transcription:
-            log.warning("Empty transcription, skipping")
-            return
-
-        # 4. Chat completion
-        reply = chat_completion(transcription)
-
-        # 5. Text-to-speech
-        tts_path = text_to_speech(reply)
-
-        # 6. Build URL for Sonos
-        tts_filename = os.path.basename(tts_path)
-        audio_url = f"http://{local_ip}:{HTTP_PORT}/{tts_filename}"
-
-        # 7. Play on Sonos
-        play_on_sonos(speaker, audio_url)
-
-        # 8. Clean up temp file after Sonos has had time to fetch it
-        time.sleep(30)
-        try:
-            os.unlink(tts_path)
-        except OSError:
-            pass
-
+        conn.sendall(DONE_BYTE)
     except Exception:
-        log.error("Error handling client", exc_info=True)
+        log.warning("Failed to send done byte", exc_info=True)
     finally:
         conn.close()
-        log.info("Connection from %s closed", addr)
+
+
+def receiver_thread(conn: socket.socket, addr: tuple):
+    """Receive audio from ESP32 and put it on the queue."""
+    log.info("Connection from %s", addr)
+    try:
+        pcm_data = receive_audio(conn)
+        if pcm_data:
+            audio_queue.put((pcm_data, conn))
+        else:
+            log.warning("No audio data received from %s", addr)
+            conn.close()
+    except Exception:
+        log.error("Error receiving audio from %s", addr, exc_info=True)
+        conn.close()
+
+
+def processor_loop(speaker: soco.SoCo, local_ip: str):
+    """Single-threaded loop that processes audio from the queue one at a time."""
+    while True:
+        pcm_data, conn = audio_queue.get()
+
+        try:
+            # 1. Transcribe
+            wav_file = pcm_to_wav(pcm_data)
+            transcription = transcribe_audio(wav_file)
+            if not transcription:
+                log.warning("Empty transcription, skipping")
+                _send_done_and_close(conn)
+                continue
+
+            # 2. Chat completion
+            reply = chat_completion(transcription)
+
+            # 3. Text-to-speech
+            tts_path = text_to_speech(reply)
+
+            # 4. Play on Sonos
+            tts_filename = os.path.basename(tts_path)
+            audio_url = f"http://{local_ip}:{HTTP_PORT}/{tts_filename}"
+            play_on_sonos(speaker, audio_url)
+
+            # 5. Wait for Sonos to finish playing
+            wait_for_sonos_done(speaker)
+
+            # 6. Signal ESP32 that we're done
+            _send_done_and_close(conn)
+
+            # 7. Clean up temp file
+            try:
+                os.unlink(tts_path)
+            except OSError:
+                pass
+
+        except Exception:
+            log.error("Error processing audio", exc_info=True)
+            _send_done_and_close(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -347,19 +386,26 @@ def main():
     # Discover Sonos
     speaker = discover_sonos(args.ip)
 
-    # TCP server
+    # Start the single-threaded processor
+    threading.Thread(
+        target=processor_loop,
+        args=(speaker, local_ip),
+        daemon=True,
+    ).start()
+
+    # TCP server — accepts connections and queues audio
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((TCP_HOST, TCP_PORT))
-    srv.listen(1)
+    srv.listen(5)
     log.info("TCP server listening on %s:%d", TCP_HOST, TCP_PORT)
 
     try:
         while True:
             conn, addr = srv.accept()
             threading.Thread(
-                target=handle_client,
-                args=(conn, addr, speaker, local_ip),
+                target=receiver_thread,
+                args=(conn, addr),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
