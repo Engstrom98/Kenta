@@ -1,19 +1,23 @@
 import argparse
 import queue
+import signal
 import socket
 import wave
 import io
 import os
+import shutil
 import time
 import logging
 import threading
 import tempfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from functools import partial
+from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
 import soco
+from zeroconf import Zeroconf, ServiceInfo
 
 load_dotenv()
 
@@ -36,6 +40,10 @@ OPENAI_MODEL_STT = "gpt-4o-mini-transcribe"
 OPENAI_TTS_VOICE = "onyx"
 
 HISTORY_TIMEOUT = 7200  # seconds (2 hours) of inactivity before clearing history
+MAX_HISTORY_MESSAGES = 20  # max user+assistant message pairs kept
+
+MAX_AUDIO_BUFFER = 3 * 1024 * 1024  # ~95s of 16kHz 16-bit mono
+RECV_TIMEOUT = 30  # seconds
 
 SONOS_SPEAKER_NAME = "Sovrum"
 
@@ -44,6 +52,9 @@ SYSTEM_PROMPT = (
     "conversational, suitable for being spoken aloud. Aim for 1-3 sentences "
     "unless the user asks for detail."
 )
+
+# Module-level TTS directory, set during main()
+TTS_DIR: str | None = None
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -114,7 +125,12 @@ def transcribe_audio(wav_file: io.BytesIO) -> str:
 # OpenAI: Chat Completion
 # ---------------------------------------------------------------------------
 def chat_completion(user_text: str) -> str:
-    """Send user text to ChatGPT and return the assistant reply."""
+    """Send user text to ChatGPT and return the assistant reply.
+
+    The lock is held for the entire API call to prevent history mutation
+    between read and write.  This serializes requests, but matches the
+    single-threaded processor_loop design.
+    """
     global last_message_time
 
     log.info("Getting chat completion...")
@@ -126,18 +142,24 @@ def chat_completion(user_text: str) -> str:
             conversation_history.clear()
         conversation_history.append({"role": "user", "content": user_text})
         last_message_time = now
+
+        # Trim oldest pair when history exceeds limit
+        while len(conversation_history) > MAX_HISTORY_MESSAGES:
+            conversation_history.pop(0)  # remove oldest user msg
+            if conversation_history and conversation_history[0]["role"] == "assistant":
+                conversation_history.pop(0)  # remove its paired assistant reply
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *conversation_history,
         ]
 
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL_CHAT,
-        messages=messages,
-    )
-    reply = response.choices[0].message.content.strip()
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL_CHAT,
+            messages=messages,
+        )
+        reply = response.choices[0].message.content.strip()
 
-    with history_lock:
         conversation_history.append({"role": "assistant", "content": reply})
 
     log.info("Chat reply: %s", reply)
@@ -147,11 +169,12 @@ def chat_completion(user_text: str) -> str:
 # ---------------------------------------------------------------------------
 # OpenAI: Text-to-Speech
 # ---------------------------------------------------------------------------
-def text_to_speech(text: str) -> str:
+def text_to_speech(text: str, tts_dir: str | None = None) -> str:
     """Convert text to speech via OpenAI TTS. Returns path to the MP3 file."""
     log.info("Generating TTS audio...")
+    target_dir = tts_dir or TTS_DIR or tempfile.gettempdir()
     tmp = tempfile.NamedTemporaryFile(
-        suffix=".mp3", delete=False, dir=tempfile.gettempdir()
+        suffix=".mp3", delete=False, dir=target_dir
     )
     tmp_path = tmp.name
     tmp.close()
@@ -172,6 +195,33 @@ def text_to_speech(text: str) -> str:
 # HTTP server (serves TTS files to Sonos)
 # ---------------------------------------------------------------------------
 class _TtsHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        # Block directory listings
+        if self.path.rstrip("/") == "" or self.path == "/":
+            self.send_error(403, "Directory listing not allowed")
+            return
+
+        # Resolve the requested path relative to the served directory
+        rel_path = self.path.lstrip("/")
+        base_dir = Path(self.directory).resolve()
+        requested = (base_dir / rel_path).resolve()
+
+        # Prevent path traversal
+        if not str(requested).startswith(str(base_dir)):
+            self.send_error(403, "Forbidden")
+            return
+
+        # Only serve .mp3 files
+        if not requested.suffix.lower() == ".mp3":
+            self.send_error(403, "Only .mp3 files are served")
+            return
+
+        if not requested.is_file():
+            self.send_error(404, "File not found")
+            return
+
+        super().do_GET()
+
     def handle(self):
         try:
             super().handle()
@@ -278,14 +328,21 @@ def wait_for_sonos_done(speaker: soco.SoCo, timeout: int = 120):
 def receive_audio(conn: socket.socket) -> bytes:
     """Receive raw PCM audio until the end marker is detected."""
     buf = bytearray()
+    conn.settimeout(RECV_TIMEOUT)
     while True:
         try:
             chunk = conn.recv(4096)
+        except socket.timeout:
+            log.warning("Client recv timeout after %ds", RECV_TIMEOUT)
+            return bytes(buf) if buf else bytes()
         except ConnectionResetError:
             log.warning("Client connection reset")
             return bytes()
         if not chunk:
             log.warning("Client disconnected before sending end marker")
+            return bytes(buf)
+        if len(buf) + len(chunk) > MAX_AUDIO_BUFFER:
+            log.warning("Audio buffer exceeded %d bytes, truncating", MAX_AUDIO_BUFFER)
             return bytes(buf)
         buf.extend(chunk)
         if len(buf) >= 4 and buf[-4:] == END_MARKER:
@@ -336,12 +393,11 @@ def processor_loop(speaker: soco.SoCo, local_ip: str):
             wav_file = pcm_to_wav(pcm_data)
             transcription = transcribe_audio(wav_file)
             if not transcription:
-                log.warning("Empty transcription, skipping")
-                _send_done_and_close(conn)
-                continue
-
-            # 2. Chat completion
-            reply = chat_completion(transcription)
+                log.warning("Empty transcription, playing error message")
+                reply = "Sorry, I didn't catch that. Could you try again?"
+            else:
+                # 2. Chat completion
+                reply = chat_completion(transcription)
 
             # 3. Text-to-speech
             tts_path = text_to_speech(reply)
@@ -369,9 +425,29 @@ def processor_loop(speaker: soco.SoCo, local_ip: str):
 
 
 # ---------------------------------------------------------------------------
+# mDNS advertisement via zeroconf
+# ---------------------------------------------------------------------------
+def start_mdns(local_ip: str) -> tuple[Zeroconf, ServiceInfo]:
+    """Register _kenta._tcp.local. so ESP32 can find us as kenta.local."""
+    zc = Zeroconf()
+    info = ServiceInfo(
+        "_kenta._tcp.local.",
+        "Kenta Voice Server._kenta._tcp.local.",
+        addresses=[socket.inet_aton(local_ip)],
+        port=TCP_PORT,
+        server="kenta.local.",
+    )
+    zc.register_service(info)
+    log.info("mDNS: registered kenta.local (%s:%d)", local_ip, TCP_PORT)
+    return zc, info
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    global TTS_DIR
+
     parser = argparse.ArgumentParser(description="ESP32 voice assistant server")
     parser.add_argument("--ip", help="Sonos speaker IP (skip discovery)")
     args = parser.parse_args()
@@ -379,9 +455,15 @@ def main():
     local_ip = get_local_ip()
     log.info("Server LAN IP: %s", local_ip)
 
-    # Start HTTP server for Sonos
-    temp_dir = tempfile.gettempdir()
-    start_http_server(HTTP_PORT, temp_dir)
+    # Create dedicated TTS directory
+    TTS_DIR = tempfile.mkdtemp(prefix="kenta_tts_")
+    log.info("TTS directory: %s", TTS_DIR)
+
+    # Start HTTP server for Sonos (serves only from TTS_DIR)
+    httpd = start_http_server(HTTP_PORT, TTS_DIR)
+
+    # mDNS advertisement
+    zc, zc_info = start_mdns(local_ip)
 
     # Discover Sonos
     speaker = discover_sonos(args.ip)
@@ -400,6 +482,28 @@ def main():
     srv.listen(5)
     log.info("TCP server listening on %s:%d", TCP_HOST, TCP_PORT)
 
+    def _shutdown(signum=None, frame=None):
+        log.info("Shutting down...")
+        try:
+            zc.unregister_service(zc_info)
+            zc.close()
+        except Exception:
+            pass
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.close()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(TTS_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGTERM, _shutdown)
+
     try:
         while True:
             conn, addr = srv.accept()
@@ -409,9 +513,9 @@ def main():
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
-        log.info("Shutting down")
+        log.info("KeyboardInterrupt received")
     finally:
-        srv.close()
+        _shutdown()
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
+#include "mdns.h"
 
 static const char *TAG = "kenta";
 
@@ -18,9 +19,13 @@ static const char *TAG = "kenta";
 #define WIFI_SSID     CONFIG_WIFI_SSID
 #define WIFI_PASS     CONFIG_WIFI_PASS
 
-// Server
+// Server — fallback IP from menuconfig, prefer mDNS resolution
 #define SERVER_IP     CONFIG_SERVER_IP
 #define SERVER_PORT   12345
+#define MDNS_HOSTNAME "kenta"
+#define MDNS_RESOLVE_RETRIES 5
+#define MDNS_RESOLVE_TIMEOUT_MS 3000
+#define MDNS_RETRY_DELAY_MS  1000
 
 // I2S pins
 #define PIN_SCK  32
@@ -48,6 +53,12 @@ static const char *TAG = "kenta";
 // recv() timeout in PROCESSING state (seconds)
 #define RECV_TIMEOUT_S  120
 
+// Button debounce time (microseconds)
+#define DEBOUNCE_US (30 * 1000)
+
+// Error LED flash duration (microseconds)
+#define ERROR_FLASH_US (500 * 1000)
+
 // End marker expected by server
 static const uint8_t END_MARKER[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 
@@ -66,6 +77,13 @@ static SemaphoreHandle_t wifi_ready;
 static int32_t i2s_raw[PCM_FRAME_LEN];
 static int16_t pcm_frame[PCM_FRAME_LEN];
 
+// Resolved server IP (filled by mDNS or fallback)
+static char resolved_ip[64] = {0};
+
+// Button debounce state
+static int64_t last_button_change = 0;
+static bool debounced_state = false;  // false = not pressed (button is active low)
+
 // ---------------------------------------------------------------------------
 // Button
 // ---------------------------------------------------------------------------
@@ -83,7 +101,21 @@ static void button_init(void)
 
 static bool button_pressed(void)
 {
-    return gpio_get_level(PIN_BUTTON) == 0;  // active low
+    bool raw = (gpio_get_level(PIN_BUTTON) == 0);  // active low
+    int64_t now = esp_timer_get_time();
+
+    if (raw != debounced_state) {
+        if (last_button_change == 0) {
+            last_button_change = now;
+        } else if (now - last_button_change > DEBOUNCE_US) {
+            debounced_state = raw;
+            last_button_change = 0;
+        }
+    } else {
+        last_button_change = 0;
+    }
+
+    return debounced_state;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +152,23 @@ static void led_solid_green(void)
     gpio_set_level(PIN_LED_R, 0);
     gpio_set_level(PIN_LED_G, 1);
     gpio_set_level(PIN_LED_B, 0);
+}
+
+static void led_solid_red(void)
+{
+    gpio_set_level(PIN_LED_R, 1);
+    gpio_set_level(PIN_LED_G, 0);
+    gpio_set_level(PIN_LED_B, 0);
+}
+
+static void led_flash_red(void)
+{
+    led_solid_red();
+    int64_t start = esp_timer_get_time();
+    while (esp_timer_get_time() - start < ERROR_FLASH_US) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    led_off();
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +213,36 @@ static void wifi_init(void)
 }
 
 // ---------------------------------------------------------------------------
+// mDNS hostname resolution
+// ---------------------------------------------------------------------------
+static bool resolve_mdns_hostname(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    for (int attempt = 0; attempt < MDNS_RESOLVE_RETRIES; attempt++) {
+        ESP_LOGI(TAG, "Resolving %s.local (attempt %d/%d)...",
+                 MDNS_HOSTNAME, attempt + 1, MDNS_RESOLVE_RETRIES);
+
+        esp_ip4_addr_t addr;
+        addr.addr = 0;
+        err = mdns_query_a(MDNS_HOSTNAME, MDNS_RESOLVE_TIMEOUT_MS, &addr);
+        if (err == ESP_OK) {
+            snprintf(resolved_ip, sizeof(resolved_ip), IPSTR, IP2STR(&addr));
+            ESP_LOGI(TAG, "Resolved %s.local -> %s", MDNS_HOSTNAME, resolved_ip);
+            return true;
+        }
+        ESP_LOGW(TAG, "mDNS query failed: %s, retrying...", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(MDNS_RETRY_DELAY_MS));
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // I2S
 // ---------------------------------------------------------------------------
 static void i2s_init(void)
@@ -198,22 +277,28 @@ static void i2s_init(void)
 
 // ---------------------------------------------------------------------------
 // Read one PCM frame from I2S (256 samples), convert to 16-bit
+// Returns true on success, false on error.
 // ---------------------------------------------------------------------------
-static void read_i2s_pcm(void)
+static bool read_i2s_pcm(void)
 {
     size_t bytes_read;
     int samples_got = 0;
 
     while (samples_got < PCM_FRAME_LEN) {
         int need = PCM_FRAME_LEN - samples_got;
-        i2s_channel_read(rx_chan, i2s_raw + samples_got,
+        esp_err_t err = i2s_channel_read(rx_chan, i2s_raw + samples_got,
                          need * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "i2s_channel_read error: %s", esp_err_to_name(err));
+            return false;
+        }
         samples_got += bytes_read / sizeof(int32_t);
     }
 
     for (int i = 0; i < PCM_FRAME_LEN; i++) {
         pcm_frame[i] = (int16_t)(i2s_raw[i] >> 16);
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +310,7 @@ static int tcp_connect(void)
         .sin_family = AF_INET,
         .sin_port = htons(SERVER_PORT),
     };
-    inet_pton(AF_INET, SERVER_IP, &dest.sin_addr);
+    inet_pton(AF_INET, resolved_ip, &dest.sin_addr);
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -234,7 +319,7 @@ static int tcp_connect(void)
     }
 
     if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
-        ESP_LOGE(TAG, "TCP connect to %s:%d failed", SERVER_IP, SERVER_PORT);
+        ESP_LOGE(TAG, "TCP connect to %s:%d failed", resolved_ip, SERVER_PORT);
         close(sock);
         return -1;
     }
@@ -260,6 +345,13 @@ void app_main(void)
     ESP_LOGI(TAG, "Waiting for WiFi...");
     xSemaphoreTake(wifi_ready, portMAX_DELAY);
 
+    // Resolve server via mDNS, fall back to config IP
+    if (!resolve_mdns_hostname()) {
+        ESP_LOGW(TAG, "mDNS resolution failed, falling back to %s", SERVER_IP);
+        strncpy(resolved_ip, SERVER_IP, sizeof(resolved_ip) - 1);
+        resolved_ip[sizeof(resolved_ip) - 1] = '\0';
+    }
+
     // Discard startup I2S samples
     for (int i = 0; i < 8; i++) {
         read_i2s_pcm();
@@ -270,6 +362,7 @@ void app_main(void)
     state_t state = STATE_IDLE;
     int sock = -1;
     int64_t wait_start = 0;
+    int64_t process_start = 0;
     bool led_on = false;
     int64_t last_blink = 0;
 
@@ -281,6 +374,7 @@ void app_main(void)
             if (button_pressed()) {
                 sock = tcp_connect();
                 if (sock < 0) {
+                    led_flash_red();
                     // Wait for button release before retrying
                     while (button_pressed()) {
                         vTaskDelay(pdMS_TO_TICKS(50));
@@ -297,12 +391,15 @@ void app_main(void)
 
         // ==== RECORDING: stream audio while button is held ====
         case STATE_RECORDING:
-            read_i2s_pcm();
+            if (!read_i2s_pcm()) {
+                ESP_LOGW(TAG, "I2S read error, retrying...");
+                break;
+            }
             if (send(sock, pcm_frame, PCM_FRAME_LEN * sizeof(int16_t), 0) < 0) {
                 ESP_LOGE(TAG, "send() failed, aborting");
                 close(sock);
                 sock = -1;
-                led_off();
+                led_flash_red();
                 state = STATE_IDLE;
                 break;
             }
@@ -339,19 +436,30 @@ void app_main(void)
             if (now - wait_start > WAIT_TIMEOUT_US) {
                 // Grace period expired — send end marker and wait for server
                 ESP_LOGI(TAG, "Grace period expired, processing...");
-                send(sock, END_MARKER, sizeof(END_MARKER), 0);
+                if (send(sock, END_MARKER, sizeof(END_MARKER), 0) < 0) {
+                    ESP_LOGE(TAG, "send() end marker failed");
+                    close(sock);
+                    sock = -1;
+                    led_flash_red();
+                    state = STATE_IDLE;
+                    break;
+                }
 
                 // Switch to solid green
                 led_solid_green();
+                process_start = esp_timer_get_time();
                 state = STATE_PROCESSING;
             } else {
                 // Keep streaming audio during wait (captures trailing speech)
-                read_i2s_pcm();
+                if (!read_i2s_pcm()) {
+                    ESP_LOGW(TAG, "I2S read error during wait, retrying...");
+                    break;
+                }
                 if (send(sock, pcm_frame, PCM_FRAME_LEN * sizeof(int16_t), 0) < 0) {
                     ESP_LOGE(TAG, "send() failed during wait");
                     close(sock);
                     sock = -1;
-                    led_off();
+                    led_flash_red();
                     state = STATE_IDLE;
                 }
             }
@@ -388,18 +496,18 @@ void app_main(void)
                 ESP_LOGE(TAG, "select() error, returning to idle");
                 close(sock);
                 sock = -1;
-                led_off();
+                led_flash_red();
                 state = STATE_IDLE;
                 break;
             }
 
-            // Overall timeout check
+            // Overall timeout check (use process_start, not wait_start)
             int64_t now = esp_timer_get_time();
-            if (now - wait_start > (int64_t)RECV_TIMEOUT_S * 1000 * 1000) {
+            if (now - process_start > (int64_t)RECV_TIMEOUT_S * 1000 * 1000) {
                 ESP_LOGW(TAG, "Processing timeout (%ds), returning to idle", RECV_TIMEOUT_S);
                 close(sock);
                 sock = -1;
-                led_off();
+                led_flash_red();
                 state = STATE_IDLE;
                 break;
             }
